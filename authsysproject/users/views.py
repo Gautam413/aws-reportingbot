@@ -137,12 +137,12 @@ from django.views.decorators.http import require_http_methods #by Rohan Jangid 2
 from pdf2docx import Converter
 import tempfile
 from django.http import FileResponse, Http404
-import pypandoc  # pip install pypandoc
+# import pypandoc  # pip install pypandoc
 
 from django.http import HttpResponseBadRequest
 
-from django.core.mail import EmailMessage
-from django.http import HttpResponseBadRequest
+
+from users.models.faq import FAQ
 
 
 def login(request):
@@ -1171,9 +1171,22 @@ def client_dashboard(request):
         sorted_pdf_on_db = sorted(
             [pdf.pdf_on_db for pdf in page_obj.object_list if pdf.pdf_on_db is not None]
         )
+        from support_chat.models import ChatRoom
+
+        # room = ChatRoom.objects.filter(participant1=request.user).first()
+        # room = ChatRoom.objects.get_or_create(participant1=request.user)
+        # Try to find existing room for this user
+        user = request.user
+
+        room = ChatRoom.objects.filter(participant1=user).first()
+
+# If not exists, create with only participant1 (no staff yet)
+        if not room:
+            room = ChatRoom.objects.create(participant1=user) 
 
         # 🔹 Prepare context
         context = {
+            'room': room,
             'pdfs': page_obj,
             'Test_Dates': sorted_test_dates,
             'PDF_On_Db' : sorted_pdf_on_db,
@@ -6524,7 +6537,19 @@ def clientdata(request):
         'search_query': search_query,
     }
 
+    from support_chat.models import ChatRoom
+
+      
+    user = request.user
+
+    room = ChatRoom.objects.filter(participant1=user).first()
+
+# If not exists, create with only participant1 (no staff yet)
+    if not room:
+        room = ChatRoom.objects.create(participant1=user) 
+
     return render(request, 'users/upload_dicom.html', {
+        'room': room,
         'dicom_data': page_obj,
         'edit_permissions': edit_permissions,
         'page_obj': page_obj,
@@ -6920,8 +6945,9 @@ def send_whatsapp(request):
             return JsonResponse({"success": False, "message": "Missing required fields."}, status=400)
 
         API_URL = "https://app2.cunnekt.com/v1/sendnotification"
-        API_KEY = "33c0c252d80b77bce62342b08a6902d7774e9a8f"
-        TEMPLATE_ID = "730036499641018"  
+        API_KEY = "74fcc289444d70ee119a00374a5e786cf908eddb"
+
+        TEMPLATE_ID = "3073529896143435"  
 
         headers = {
             "Content-Type": "application/json",
@@ -8793,158 +8819,38 @@ def get_dicom_notes(request):
 
 
 
-@csrf_exempt
-def email_pdf_with_logo(request, patient_id):
-    if request.method != 'POST':
-        return JsonResponse({'error': 'Invalid request method'}, status=405)
 
-    try:
-        data = json.loads(request.body)
-        email = data.get('email')
-        name = data.get('name')
-
-        if not email or not name:
-            return JsonResponse({'error': 'Name and email are required'}, status=400)
-
-        print(f"📩 Starting email process for patient_id={patient_id}, name={name}, email={email}")
-
-        try:
-            report = XrayReport.objects.get(patient_id=patient_id)
-            print(f"✅ Report found: {report.pdf_file.name}")
-        except XrayReport.DoesNotExist:
-            print(f"⚠️ Report not found for patient_id {patient_id}")
-            report = None
-
-        client = Client.objects.first()
-        # client = Client.objects.get(user=request.user)
-        if not client or not client.upload_header or not client.upload_footer:
-            print("⚠️ Client or header/footer missing")
-            client = None
-
-        final_output_path = None
-        should_attach = False
-
-        if report:
-            try:
-                pdf_url = presigned_url('u4rad-s3-reporting-bot', report.pdf_file.name)
-
-                response = requests.get(pdf_url)
-                if response.status_code != 200:
-                    raise ValueError("PDF download failed")
-
-                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temp_pdf:
-                    temp_pdf.write(response.content)
-                    original_pdf_path = temp_pdf.name
-
-                def get_image_path(image_field):
-                    if hasattr(image_field, 'path') and os.path.exists(image_field.path):
-                        return image_field.path
-                    elif default_storage.exists(image_field.name):
-                        with default_storage.open(image_field.name, 'rb') as f:
-                            content = f.read()
-                            with tempfile.NamedTemporaryFile(suffix=os.path.splitext(image_field.name)[1], delete=False) as temp_img:
-                                temp_img.write(content)
-                                return temp_img.name
-                    return None
-
-                logo_path = get_image_path(client.upload_header)
-                footer_path = get_image_path(client.upload_footer)
-
-                if not logo_path or not footer_path:
-                    raise FileNotFoundError("Logo/footer file not found")
-
-                reader = PdfReader(original_pdf_path)
-                writer = PdfWriter()
-
-                for page in reader.pages:
-                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as overlay_temp:
-                        c = canvas.Canvas(overlay_temp.name, pagesize=letter)
-                        page_width, page_height = letter
-                        c.drawImage(logo_path, x=0, y=page_height - 50, width=page_width, height=50)
-                        c.drawImage(footer_path, x=0, y=5, width=page_width, height=40)
-                        c.save()
-                        overlay_pdf_path = overlay_temp.name
-
-                    overlay = PdfReader(overlay_pdf_path)
-                    page.merge_page(overlay.pages[0])
-                    writer.add_page(page)
-                    os.unlink(overlay_pdf_path)
-
-                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as final_output:
-                    writer.write(final_output)
-                    final_output_path = final_output.name
-                    should_attach = True
-                print(f"✅ Modified PDF ready at {final_output_path}")
-
-            except Exception as e:
-                print(f"⚠️ Failed to process PDF: {e}")
-                should_attach = False
-
-        subject = f"Your Medical Report - {name}"
-        if should_attach:
-            body = f"Dear {name},\n\nPlease find your medical report attached.\n\nRegards,\nYour Clinic"
-        else:
-            body = f"Dear {name},\n\nWe could not attach your report, but it is being worked on. We'll send it shortly or contact your provider if needed.\n\nRegards,\nYour Clinic"
-
-        email_message = EmailMessage(subject, body, to=[email])
-        if should_attach:
-            print("📎 Attaching PDF to email")
-            email_message.attach_file(final_output_path)
-
-        email_message.send()
-        print(f"✅ Email sent to {email} (with{'out' if not should_attach else ''} attachment)")
-
-        if should_attach and final_output_path and os.path.exists(final_output_path):
-            os.unlink(final_output_path)
-
-        return JsonResponse({'message': f'Email sent to {email} ({"with" if should_attach else "without"} PDF)'})
-
-    except Exception as e:
-        print(f"❌ Fatal error: {e}")
-        return JsonResponse({'error': str(e)}, status=500)
+from django.contrib.auth.models import Group
+from .forms import FAQForm
 
 
+@login_required
+def view_faq(request):
+    group_name = ''
+    if request.user.groups.exists():
+        group_name = request.user.groups.first().name
+
+    faqs = FAQ.objects.filter(target_group=group_name).order_by('-created_at')
+
+    return render(request, 'users/view_faq.html', {'faqs': faqs, 'group_name': group_name})
 
 
-def email_pdf_raw(request, patient_id):
-    if request.method != 'POST':
-        return JsonResponse({'error': 'Invalid request method'}, status=405)
+from django.contrib import messages
 
-    try:
-        data = json.loads(request.body)
-        email = data.get('email')
-        name = data.get('name')
-        pdf_url = data.get('pdf_url')
+@login_required
+def create_faq(request):
+    if not request.user.groups.filter(name='xraycoordinator').exists():
+        return redirect('view_faq')
 
-        if not email or not name or not pdf_url:
-            return JsonResponse({'error': 'Missing required fields'}, status=400)
-        
-        if email is None:
-            return JsonResponse({'error': 'Email is required'}, status=400)
+    if request.method == 'POST':
+        form = FAQForm(request.POST)
+        if form.is_valid():
+            faq = form.save(commit=False)
+            faq.created_by = request.user
+            faq.save()
+            messages.success(request, 'FAQ created successfully!')
+            form = FAQForm() 
+    else:
+        form = FAQForm()
 
-        print(f"📩 Emailing raw PDF for patient_id={patient_id}, name={name}, email={email}")
-
-        # Download the PDF from the presigned URL
-        response = requests.get(pdf_url)
-        if response.status_code != 200:
-            raise ValueError("Failed to download PDF")
-
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temp_pdf:
-            temp_pdf.write(response.content)
-            temp_pdf_path = temp_pdf.name
-
-        # Compose the email
-        subject = f"Your Medical Report - {name}"
-        body = f"Dear {name},\n\nPlease find your medical report attached.\n\nRegards,\nYour Clinic"
-        email_message = EmailMessage(subject, body, to=[email])
-        email_message.attach_file(temp_pdf_path)
-        email_message.send()
-        print(f"✅ Raw PDF emailed to {email}")
-
-        # Remove the temp file
-        os.unlink(temp_pdf_path)
-        return JsonResponse({'message': f'Raw PDF emailed to {email}'})
-    
-    except Exception as e:
-        print(f"❌ Fatal error: {e}")
-        return JsonResponse({'error': str(e)}, status=500)
+    return render(request, 'users/create_faq.html', {'form': form})
